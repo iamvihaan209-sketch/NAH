@@ -1,0 +1,135 @@
+name: Build and Release NAH
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (example: v1.0)"
+        required: false
+        default: ""
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    if: ${{ hashFiles('src/nah_gui.py', 'src/nah.py') != '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: Linux
+            asset: NAH-Linux-v1.0.zip
+          - os: windows-latest
+            label: Windows
+            asset: NAH-Windows-v1.0.zip
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pyinstaller
+
+      - name: Build Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd src
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name NAH nah_gui.py
+          mkdir -p ../release/NAH-Linux-v1.0
+          cp dist/NAH ../release/NAH-Linux-v1.0/NAH
+          cp ../README.md ../release/NAH-Linux-v1.0/README.md
+          cp ../LICENSE ../release/NAH-Linux-v1.0/LICENSE
+          chmod +x ../release/NAH-Linux-v1.0/NAH
+          cd ../release
+          zip -r NAH-Linux-v1.0.zip NAH-Linux-v1.0
+
+      - name: Build Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location src
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name NAH nah_gui.py
+          New-Item -ItemType Directory -Force ../release/NAH-Windows-v1.0 | Out-Null
+          Copy-Item dist/NAH.exe ../release/NAH-Windows-v1.0/NAH.exe
+          Copy-Item ../README.md ../release/NAH-Windows-v1.0/README.md
+          Copy-Item ../LICENSE ../release/NAH-Windows-v1.0/LICENSE
+          if (Test-Path ../windows/Register-NAH.ps1) { Copy-Item ../windows/Register-NAH.ps1 ../release/NAH-Windows-v1.0/Register-NAH.ps1 }
+          if (Test-Path ../windows/Unregister-NAH.ps1) { Copy-Item ../windows/Unregister-NAH.ps1 ../release/NAH-Windows-v1.0/Unregister-NAH.ps1 }
+          Set-Location ../release
+          Compress-Archive -Path NAH-Windows-v1.0 -DestinationPath NAH-Windows-v1.0.zip -Force
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}-v1.0
+          path: release/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [build]
+    if: ${{ always() && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Download built packages
+        if: needs.build.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          elif [[ -n "${{ inputs.tag }}" ]]; then
+            echo "value=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=v1.0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.value }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          assets=()
+          if [[ -d artifacts ]]; then
+            while IFS= read -r -d '' file; do assets+=("$file"); done < <(find artifacts -type f -name '*.zip' -print0)
+          fi
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; uploading any new assets."
+            if ((${#assets[@]})); then
+              gh release upload "$TAG" "${assets[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+            fi
+          else
+            gh release create "$TAG" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "NAH $TAG" \
+              --generate-notes \
+              --target "$GITHUB_SHA"
+          fi
